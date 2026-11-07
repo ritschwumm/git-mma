@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# bits and pieces of a jujutsu-like workflow using git-restack
+#===============================================================================
+
+#-----------------------------------------------------------------------------
+# logging
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+#-----------------------------------------------------------------------------
+# main command
+
+# something like "git ox"
+git_command=$(basename -- "$0" | sed 's/^git-/git /')
+
+main_usage() {
+	block "
+		$git_command - bits and pieces of a jujutsu-like workflow using git-restack
+
+		$(help_usage		| multiline)
+
+		$(amend_usage		| multiline)
+
+		$(append_usage		| multiline)
+
+		$(reword_usage		| multiline)
+
+		$(delete_usage		| multiline)
+
+		$(completion_usage	| multiline)
+	"
+}
+main_command() {
+	good_usage()	{ log "$(main_usage)"; exit 0; }
+	bad_usage()		{ log "$(main_usage)"; log ""; die "$@"; }
+
+	# regular parsing does not work here:
+	# we do not want to swallow any arguments
+	# TODO ox maybe we can make git ox -h amend work?
+	(( $# == 0 ))		&& good_usage
+	[[ $1 == "-h" ]]	&& good_usage
+	local positionals=( "$@" )
+
+	(( ${#positionals[@]} >= 1 ))	|| bad_usage "missing parameter"
+	local command=${positionals[0]}
+	local arguments=( "${positionals[@]:1}" )
+
+	case "$command" in
+		amend)		amend_command		"${arguments[@]}";;
+		append)		append_command		"${arguments[@]}";;
+		reword)		reword_command		"${arguments[@]}";;
+		delete)		delete_command		"${arguments[@]}";;
+		completion)	completion_command	"${arguments[@]}";;
+		*)			die "unexpected command $command";;
+	esac
+}
+
+help_usage() {
+	block "
+		$git_command -h - show this help page
+
+			\$ $git_command -h
+	"
+}
+
+#-----------------------------------------------------------------------------
+# subcommands
+
+# amend changes of the worktree into the current HEAD and restack children
+# see git fix and git damn
+amend_usage() {
+	block "
+		$git_command amend - amend changes of the worktree into the current HEAD and restack children
+
+			\$ $git_command amend [ --help/-h ] [ --push/-p ]
+	"
+}
+amend_command() {
+	good_usage()	{ log "$(amend_usage)"; exit 0; }
+	bad_usage()		{ log "$(amend_usage)"; log ""; die "$@"; }
+
+	local opt_push="false"
+	local positionals=()
+	while (( $# > 0 )); do
+		case "$1" in
+			--)				shift; positionals+=( "$@" ); break;;
+			-h | --help)	good_usage;;
+			-p | --push)	shift; opt_push="true";;
+			-*)				bad_usage "unexpected option $1";;
+			*)				positionals+=( "$1" ); shift;;
+		esac
+	done
+
+	(( ${#positionals[@]} == 0 ))	|| bad_usage "unexpected parameter"
+
+	local back_pos
+	back_pos=$(git_position HEAD)					|| die "cannot identify return position"
+
+	local target_hash
+	target_hash=$(git_identifier HEAD)				|| die "cannot identify target commit"
+
+	# we may be on a named branch: we detach from it here so the branch move is left to git-restack
+	git checkout --quiet --detach					|| die "cannot detach from branch"
+	git_add_all										|| die "cannot add worktree changes"
+	git commit -a --amend --no-edit --allow-empty	|| die "cannot amend commit"
+
+	# abuses opt_push
+	git_restack HEAD "$target_hash" --drop "$target_hash" --goto "$back_pos"	|| die "cannot restack children"
+}
+
+# commit changes of the worktree with a bare-words message and restack children
+# see git more
+# NOTE targetting an arbitrary commit would work, but break the bare-words idea
+append_usage() {
+	block "
+		$git_command append - commit changes of the worktree onto the current HEAD with a bare-words commit message and restack children
+
+			\$ $git_command append [ --help/-h ] [ --push/-p ] [ -- ] <comment> ...<comment>
+	"
+}
+append_command() {
+	good_usage()	{ log "$(append_usage)"; exit 0; }
+	bad_usage()		{ log "$(append_usage)"; log ""; die "$@"; }
+
+	local opt_push="false"
+	local positionals=()
+	while (( $# > 0 )); do
+		case "$1" in
+			--)				shift; positionals+=( "$@" ); break;;
+			-h | --help)	good_usage;;
+			-p | --push)	shift; opt_push="true";;
+			-*)				bad_usage "unexpected option $1";;
+			*)				positionals+=( "$1" ); shift;;
+		esac
+	done
+
+	(( ${#positionals[@]} != 0 ))	|| bad_usage "missing parameter"
+
+	local back_pos
+	back_pos=$(git_position HEAD)				|| die "cannot identify return position"
+
+	local target_hash
+	target_hash=$(git_identifier HEAD)			|| die "cannot identify target commit"
+
+	# we may be on a named branch: we detach from it here so the branch move is left to git-restack
+	git checkout --quiet --detach				|| die "cannot detach from branch"
+	git_add_all									|| die "cannot add worktree changes"
+	git commit --message "${positionals[*]}"	|| die "cannot add commit"
+
+	# abuses opt_push
+	git_restack HEAD "$target_hash"	--goto "$back_pos"	|| die "cannot restack children"
+}
+
+# reword a given commit or HEAD and restack children
+# see git rew
+reword_usage() {
+	block "
+		$git_command reword - edit the comment of a given commit or HEAD and restack children
+
+			\$ $git_command reword [ --help/-h ] [ --push/-p ] [ --message/-m <message> ] [ -- ] [ <committish> ]
+	"
+}
+reword_command() {
+	good_usage()	{ log "$(reword_usage)"; exit 0; }
+	bad_usage()		{ log "$(reword_usage)"; log ""; die "$@"; }
+
+	local opt_push="false"
+	local opt_message=""
+	local positionals=()
+	while (( $# > 0 )); do
+		case "$1" in
+			--)				shift; positionals+=( "$@" ); break;;
+			-h | --help)	good_usage;;
+			-p | --push)	shift; opt_push="true";;
+			-m | --message)	shift; (( $# != 0 )) || bad_usage "missing message"; opt_message="$1"; shift;;
+			-*)				bad_usage "unexpected option $1";;
+			*)				positionals+=( "$1" ); shift;;
+		esac
+	done
+
+	(( ${#positionals[@]} <= 1 ))	|| bad_usage "unexpected parameter"
+	local target_pos=${positionals[0]:-HEAD}
+
+	# we check out a different commit in between, so we have to help git restack remember where we came from
+	local back_pos
+	back_pos=$(git_position HEAD)				|| die "cannot identify return position"
+
+	local target_hash
+	target_hash=$(git_identifier "$target_pos")	|| die "cannot identify target commit"
+
+	# never checks out a named branch, so the branch move is left to git-restack
+	git checkout --quiet "$target_hash"			|| die "cannot checkout target"
+
+	if [[ -n "$opt_message" ]]
+	then git commit --amend --allow-empty --message "$opt_message"	|| die "cannot amend commit"
+	else git commit --amend --allow-empty							|| die "cannot amend commit"
+	fi
+
+	# abuses opt_push
+	git_restack HEAD "$target_hash" --drop "$target_hash" --goto "$back_pos"	|| die "cannot restack children"
+}
+
+# delete a given commit or HEAD and restack children
+delete_usage() {
+	block "
+		$git_command delete - delete a given commit or HEAD and restack children
+
+			\$ $git_command delete [ --help/-h ] [ --push/-p ] [ -- ] [ <committish> ]
+	"
+}
+delete_command() {
+	good_usage()	{ log "$(delete_usage)"; exit 0; }
+	bad_usage()		{ log "$(delete_usage)"; log ""; die "$@"; }
+
+	local opt_push="false"
+	local positionals=()
+	while (( $# > 0 )); do
+		case "$1" in
+			--)				shift; positionals+=( "$@" ); break;;
+			-h | --help)	good_usage;;
+			-p | --push)	shift; opt_push="true";;
+			-*)				bad_usage "unexpected option $1";;
+			*)				positionals+=( "$1" ); shift;;
+		esac
+	done
+
+	(( ${#positionals[@]} <= 1 ))	|| bad_usage "unexpected parameter"
+	local target_pos=${positionals[0]:-HEAD}
+
+	local target_hash
+	target_hash=$(git_identifier "$target_pos")							|| die "cannot identify target commit"
+
+	# abuses opt_push
+	git_restack "$target_hash~" "$target_hash" --drop "$target_hash"	|| die "cannot restack children"
+}
+
+# print a a bash completion script to standard out
+completion_usage() {
+	block "
+		$git_command completion - print a a bash completion script to standard out
+
+			\$ $git_command completion [ --help/-h ]
+	"
+}
+completion_command() {
+	good_usage()	{ log "$(completion_usage)"; exit 0; }
+	bad_usage()		{ log "$(completion_usage)"; log ""; die "$@"; }
+
+	local opt_push="false"
+	local positionals=()
+	while (( $# > 0 )); do
+		case "$1" in
+			--)				shift; positionals+=( "$@" ); break;;
+			-h | --help)	good_usage;;
+			-*)				bad_usage "unexpected option $1";;
+			*)				positionals+=( "$1" ); shift;;
+		esac
+	done
+
+	(( ${#positionals[@]} == 0 ))	|| bad_usage "unexpected parameter"
+
+	block <<'EOF'
+		#
+		# completion helper for bash-completion
+		#
+		# to activate this code, include this line in your ~/.bashrc
+		# $ eval "$(git-ox --completion)"
+		#
+		# the magic name "_git_ox" is used by /usr/share/bash-completion/completions/git
+		# to provide completions for the command "git ox". internally, this uses the bash builtin "complete".
+		#
+		_git_ox() {
+			# shellcheck disable=SC2154
+			if [[ "$cword" == 2 ]]; then
+				if [[ "$cur" = -* ]]; then __gitcomp "-h";	else __gitcomp "amend append reword delete completion";	fi
+			else
+				case "${words[2]}" in
+					amend)		if [[ "$cur" = -* ]]; then __gitcomp "-h --push";			else true;					fi;;
+					append)		if [[ "$cur" = -* ]]; then __gitcomp "-h --push";			else __git_complete_refs;	fi;;
+					reword)		if [[ "$cur" = -* ]]; then __gitcomp "-h --push --message";	else __git_complete_refs;	fi;;
+					delete)		if [[ "$cur" = -* ]]; then __gitcomp "-h --push";			else __git_complete_refs;	fi;;
+					completion)	if [[ "$cur" = -* ]]; then __gitcomp "-h";					else true;					fi;;
+					*)	;;
+				esac
+			fi
+		}
+EOF
+}
+
+
+#-----------------------------------------------------------------------------
+# git helper functions
+
+git_add_all() {
+	git add --all :/
+}
+
+# get the branch name or commit of $1
+git_position() {
+	git symbolic-ref -q --short "$1" ||
+	git rev-parse --verify "$1"
+}
+
+# get the commit id of $1
+git_identifier() {
+	git rev-parse --verify "$1"
+}
+
+# HACK calls git_restack with the --push argument taken from $opt_push
+git_restack() {
+	if [[ "$opt_push" == "true" ]]
+	then git restack --push "$@"
+	else git restack "$@"
+	fi
+}
+
+#-----------------------------------------------------------------------------
+# text functions
+
+# documentation formatting helper improving on both cat <<-EOT and git stripspace
+# expands tabs (size 4)
+# drops trailing spaces
+# removes blank lines at the beginning and then end
+# conflates multiple blank lines into a single one
+# removes common indentation
+# shellcheck disable=SC2120
+block() {
+	(( $# != 0 )) && { block <<<"$@"; return $?; }
+	# multiple insertion preprocessing:
+	# CR is expanded to an LF and the indent of the current line
+	# the indent here can consist of both tabs and spaces because
+	# tabs can only be expanded after we split multiples
+	# by doing this here, we can enforce the rules for blank lines
+	awk '{
+		start	= match($0, /[^ \t]/)
+		indent	= substr($0, 1, start-1)
+		gsub(/\r/, "\n" indent, $0)
+		print
+	}' |
+	expand -t 4 |
+	awk '
+		BEGIN {
+			count	= 0
+			blank	= 0
+			start	= 0
+		}
+		/[^ ]/ {
+			# here we know when to actually insert a blank line
+			if (blank && count > 0)	lines[count++]	= ""
+			blank	= 0
+
+			sub(/ +$/, "", $0)
+			lines[count++]	= $0
+
+			# calculate the new common indent: 0 is treated like +infinity here
+			indent	= match($0, /[^ ]/)
+			start	= start == 0 || indent < start ? indent : start
+		}
+		!/[^ ]/ {
+			blank	= 1
+		}
+		END	{
+			for (i=0; i<count; i++) print substr(lines[i], start)
+		}
+	'
+}
+
+# same a block, but replaces LF with CR as indented-end-of-line markers
+# the output of this can be inserted into another block or multiple
+# shellcheck disable=SC2120
+multiline() {
+	# strips trailing LFs: usually, bash strips them for us,
+	# but as it's a CR now bash will not do that any more
+	block "$@" | tr '\n' '\r' | sed 's#\r*\r$##'
+}
+
+#-----------------------------------------------------------------------------
+
+main_command "$@"

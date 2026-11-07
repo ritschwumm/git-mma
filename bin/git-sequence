@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# provide a single interface for all variants of sequenced jobs
+#===============================================================================
+
+#-----------------------------------------------------------------------------
+# logging
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+#-----------------------------------------------------------------------------
+
+# something like "git sequence"
+git_command=$(basename -- "$0" | sed 's/^git-/git /')
+
+# something like "./.git"
+git_dir=$(git rev-parse --git-dir)	|| die "cannot determine git directory"
+
+usage() {
+	block "
+		$git_command - advances the git sequencer for any sequence in progress.
+
+		currently the following commands are supported: git cherry-pick,
+		git merge, git revert, git am, git rebase, and git restack
+
+		usage
+			\$ $git_command [ --help | -dry-run ] [ --continue | --skip | --abort | --quit ]
+
+		options
+			--help		display this help
+			--dry-run	print the git command for advancement, but do not execute it
+			--continue	call the git command with --continue
+			--skip		call the git command with --skip
+			--abort		call the git command with --abort
+			--quit		call the git command with --quit
+
+			if no options are given, sequences currently running will be printed
+			and when there are no sequences running the exit code will be 1.
+	"
+}
+
+#-----------------------------------------------------------------------------
+
+main() {
+	local action=""
+	local dry_run="false"
+	local positionals=()
+	while (( $# != 0 )); do
+		case "$1" in
+			--help|-h)
+				log "$(usage)"
+				exit 0
+				;;
+			--dry-run|-n)
+				dry_run="true"
+				shift
+				break
+				;;
+			--skip|--continue|--abort|--quit)
+				action="$1"
+				shift
+				;;
+			--)
+				positionals+=( "$@" )
+				break
+				;;
+			-*)
+				log "$(usage)"
+				log ""
+				die "unexpected option" "$1"
+				;;
+			*)	positionals+=( "$1" )
+				shift
+				;;
+		esac
+	done
+	(( ${#positionals[@]} == 0 ))	|| {
+		log "$(usage)"
+		log ""
+		die "unexpected parameters" "positionalsl[@]}"
+	}
+
+	# NOTE inside a restack usually there is a cherry-pick, too,
+	# but in this case we always mean the restack, not the cherry-pick
+	local sequences=()
+	in_restack						&& sequences+=( restack )
+	in_cherry_pick && ! in_restack	&& sequences+=( cherry-pick )
+	in_merge						&& sequences+=( merge )
+	in_revert						&& sequences+=( revert )
+	in_rebase						&& sequences+=( rebase )
+	in_am							&& sequences+=( am )
+
+	log "### sequences" "${sequences[@]}"
+
+	local sequence_count="${#sequences[@]}"
+
+	if [[ "$action" == "" ]]; then
+		# exit with an error if there is no sequence running
+		(( sequence_count == 0 ))	&& exit 1
+
+		# print running sequences
+		printf '%s\n' "${sequences[@]}"
+	else
+		(( sequence_count == 0 ))	&& {
+			log "no running git sequences found"
+			log ""
+			die "nothing to do, exiting"
+		}
+
+		(( sequence_count > 1 ))	&& {
+			log "found multiple running git sequences"
+			log ""
+			log "possible next steps"
+			local sequence
+			for sequence in "${sequences[@]}"; do
+				log "\$ git $sequence $action"
+			done
+			log ""
+			die "do not know what to do, exiting"
+		}
+
+		log "found a single running git sequence"
+		log ""
+
+		local sequence="${sequences[0]}"
+
+		[[ "$sequence" == "merge" && "$action" == "--skip" ]]	&& die "git merge --skip is not supported"
+
+		if [[ "$dry_run" == "true" ]]; then
+			log "possible next step"
+			log "\$ git $sequence $action"
+			log ""
+			log "dry-run requested, exiting"
+		else
+			log "executing command"
+			log "\$ git $sequence $action"
+			log ""
+			git "$sequence" "$action"
+		fi
+	fi
+}
+
+in_restack() {
+	[[ -d "$git_dir/restack" ]]
+}
+
+in_cherry_pick() {
+	git rev-parse >/dev/null --verify --quiet CHERRY_PICK_HEAD
+}
+
+in_merge() {
+	git rev-parse >/dev/null --verify --quiet MERGE_HEAD
+}
+
+in_revert() {
+	git rev-parse >/dev/null --verify --quiet REVERT_HEAD
+}
+
+# NOTE REBASE_HEAD sometimes exist without an actual rebase being in progress
+# git rev-parse >/dev/null --verify --quiet REBASE_HEAD
+in_rebase() {
+	# inspired by git-prompt.sh
+	if [[ -d "$git_dir/rebase-merge" ]]; then
+		return 0
+	elif [[ -d "$git_dir/rebase-apply" ]]; then
+		if [[ -f "$git_dir/rebase-apply/rebasing" ]]; then
+			return 0
+		elif [[ -f "$git_dir/rebase-apply/applying" ]]; then
+			return 1
+		else
+			# NOTE according to git-prompt.sh when both files are missing, we could be in a rebase as well as an am
+			return 0
+		fi
+	else
+		return 1
+	fi
+}
+
+in_am() {
+	# inspired by git-prompt.sh
+	if [[ -d "$git_dir/rebase-merge" ]]; then
+		return 1
+	elif [[ -d "$git_dir/rebase-apply" ]]; then
+		if [[ -f "$git_dir/rebase-apply/rebasing" ]]; then
+			return 1
+		elif [[ -f "$git_dir/rebase-apply/applying" ]]; then
+			return 0
+		else
+			# NOTE according to git-prompt.sh when both files are missing, we could be in a rebase as well as an am
+			return 0
+		fi
+	else
+		return 1
+	fi
+}
+
+#-----------------------------------------------------------------------------
+# text functions
+
+# documentation formatting helper improving on both cat <<-EOT and git stripspace
+# expands tabs (size 4)
+# drops trailing spaces
+# removes blank lines at the beginning and then end
+# conflates multiple blank lines into a single one
+# removes common indentation
+block() {
+	(( $# != 0 )) && { block <<<"$@"; return $?; }
+
+	expand -t 4	|
+	awk '
+		BEGIN {
+			count	= 0
+			blank	= 0
+			start	= 0
+		}
+		/[^ ]/ {
+			# here we know when to actually insert a blank line
+			if (blank && count > 0)	lines[count++]	= ""
+			blank	= 0
+
+			sub(/ +$/, "", $0)
+			lines[count++]	= $0
+
+			# calculate the new common indent: 0 is treated like +infinity here
+			indent	= match($0, /[^ ]/)
+			start	= start == 0 || indent < start ? indent : start
+		}
+		!/[^ ]/ {
+			blank	= 1
+		}
+		END	{
+			for (i=0; i<count; i++) print substr(lines[i], start)
+		}
+	'
+}
+
+#-----------------------------------------------------------------------------
+
+main "$@"

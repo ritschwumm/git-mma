@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# check out the next later commit if unambiguous
+#===============================================================================
+
+set -u
+
+#-----------------------------------------------------------------------------
+# logging
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+#-----------------------------------------------------------------------------
+# environment and files
+
+# something like "git advance"
+git_command=$(basename -- "$0" | sed 's/^git-/git /')
+
+#-----------------------------------------------------------------------------
+# main
+
+usage="usage: $git_command [ <committish> ]"
+
+main() {
+	(( $# <= 1 ))									|| die "$usage"
+	[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]	&& { log "$usage"; exit 0; }
+	local start_position="${1:-HEAD}"
+
+	local children
+	children=$(children "$start_position")	|| die "cannot determine child commits"
+
+	local children_array=()
+	IFS=$'\n' read -rd '' -a children_array <<<"$children"
+
+	local children_count="${#children_array[@]}"
+	(( children_count > 0 ))				|| die "cannot advance, found no child commits"
+	(( children_count <= 1 ))				|| die "cannot advance, found $children_count child commits"
+
+	local selected="${children_array[0]}"
+
+	# TODO if our commit is pointed at by a single branch ref, we should check out that branch instead of the commit
+	# git for-each-ref --points-at "$selected" --format="%(refname:short)" "refs/heads/"
+
+	log "checking out commit $selected"
+	git checkout "$selected"				|| die "cannot check out commit $selected"
+}
+
+# print hashes of child commits of a given commit
+children() {
+	(( $# == 1 ))	|| die "unexpected number of parameters"
+	local start_position="$1"
+
+	local start_hash
+	start_hash=$(git rev-parse "$start_position")	|| die "cannot determine start commit"
+
+	# --not "$start_hash^@" means "exclude all parents of the start hash"
+	# --children outputs start_hash and all child hashes separated by a space
+	git rev-list --all --not "$start_hash^@" --children |
+	grep "^$start_hash"	|
+	tr ' ' '\n'			|
+	sed 1d
+}
+
+#-----------------------------------------------------------------------------
+
+main "$@"

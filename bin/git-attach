@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# switch to the single branch on the given or current commit
+#===============================================================================
+
+set -u
+
+#-----------------------------------------------------------------------------
+# logging
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+#-----------------------------------------------------------------------------
+# environment and files
+
+# something like "git later"
+git_command=$(basename -- "$0" | sed 's/^git-/git /')
+
+#-----------------------------------------------------------------------------
+# main
+
+main() {
+	local usage="usage: $git_command [ -h ] [ <committish> ]"
+
+	[[ $# -eq 1 && "$1" == "-h" ]]	&& { log "$usage"; exit 0; }
+
+	(( $# <= 1 ))	|| die "$usage"
+	local start_position="${1:-HEAD}"
+
+	local ref_list
+	ref_list=$(git for-each-ref --points-at "$start_position" --format="%(refname:short)" refs/heads/)	|| die "cannot list refs on position $start_position"
+
+	local ref_array=()
+	[[ -z "$ref_list" ]]	|| while read -r branch; do ref_array+=( "$branch" ); done <<<"$ref_list"
+
+	local ref_chosen
+	case ${#ref_array[@]} in
+		1)	ref_chosen="${ref_array[0]}";;
+		0)	die "no branch found on position $start_position";;
+		*)	log "found multiple branches on position $start_position:"
+			log
+			for ref_chosen in "${ref_array[@]}"; do
+				log "    $ref_chosen"
+			done
+			log
+			die "unable to choose, aborting"
+			;;
+	esac
+
+	git switch "${ref_chosen}"	|| die "cannot switch to branch $ref_chosen"
+}
+
+#-----------------------------------------------------------------------------
+
+main "$@"

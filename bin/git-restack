@@ -1,0 +1,913 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# rebase a whole tree of branches, maintaining their connections
+#===============================================================================
+
+set -u
+
+#-----------------------------------------------------------------------------
+# logging
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+#-----------------------------------------------------------------------------
+# environment and files
+
+# TODO hardcoded
+origin="origin"
+
+# something like "git restack"
+git_command=$(basename -- "$0" | sed 's/^git-/git /')
+
+#-----------------------------------------------------------------------------
+# main
+
+main() {
+	(( $# >= 1 ))	|| die "$(usage)"
+	case "$1" in
+		# NOTE --help only works when calling $0 directly, git swallows '--help' instead of passing it to us
+		-h|--help)		shift;	log "$(usage)";	exit 0;;
+		--continue)		shift;	cmd_continue	"$@";;
+		--skip)			shift;	cmd_skip		"$@";;
+		--abort)		shift;	cmd_abort		"$@";;
+		--quit)			shift;	cmd_quit		"$@";;
+		--no-push)		shift;	cmd_no_push		"$@";;
+		--completion)	shift;	cmd_completion	"$@";;
+		*)						cmd_move		"$@";;
+	esac
+}
+
+cmd_move() {
+	local affected="false"
+	local dry_run="false"
+	local force_push="false"
+	local drop_positions=()
+	local goto_position=""
+	local positionals=()
+	while (( $# > 0 )); do
+		case "$1" in
+			-a | --affected)
+				shift
+				affected="true"
+				;;
+			-n | --dry-run)
+				shift
+				dry_run="true"
+				;;
+			-p | --push)
+				shift
+				force_push="true"
+				;;
+			-d | --drop)
+				shift
+				(( $# > 0 ))	|| die "$(usage)"
+				drop_positions+=( "$1" )
+				shift
+				;;
+			-g | --goto)
+				shift
+				(( $# > 0 ))	|| die "$(usage)"
+				goto_position="$1"
+				shift
+				;;
+			--)
+				shift
+				positionals+=( "$@" )
+				break
+				;;
+			*)
+				positionals+=( "$1" )
+				shift
+				;;
+		esac
+	done
+
+	local positional_count="${#positionals[@]}"
+	(( positional_count >= 1 ))	|| die "$(usage)"
+	local target_position="${positionals[0]}"
+	local selectors=( "${positionals[@]:1}" )
+
+	initialize
+	gather_data  &&
+	proceed
+}
+
+cmd_continue() {
+	(( $# == 0 ))	|| die "$(usage)"
+	initialize
+	resume --continue	&&
+	proceed
+}
+
+cmd_skip() {
+	(( $# == 0 ))	|| die "$(usage)"
+	initialize
+	resume --skip		&&
+	proceed
+}
+
+cmd_abort() {
+	(( $# == 0 ))	|| die "$(usage)"
+	initialize
+	abort			&&
+	back_to_start	&&
+	remove_state
+}
+
+cmd_quit() {
+	(( $# == 0 ))	|| die "$(usage)"
+	initialize
+	# removes state by itself
+	cleanup
+}
+
+cmd_no_push() {
+	(( $# == 0 ))	|| die "$(usage)"
+	initialize
+	disable_push
+}
+
+cmd_completion() {
+	(( $# == 0 ))	|| die "$(usage)"
+	# NOTE does not call initialize because we may not even be in a git directory
+	completion
+}
+
+initialize() {
+	toplevel_dir=$(git rev-parse --show-toplevel)	|| die "cannot determine toplevel directory"
+	# log "toplevel dir: $git_dir"
+
+	git_dir=$(git rev-parse --git-dir)				|| die "cannot determine git directory"
+	# log "git dir: $git_dir"
+
+	state_dir="$git_dir/restack"
+	# log "state dir: $state_dir"
+
+	# data files
+
+	# branch or commit to go back to after completion
+	back_file="$state_dir/back"
+
+	# "true" or "false" depending on whether the user requested a dry-run
+	dry_run_file="$state_dir/dry_run"
+
+	# "true" or "false" depending on whether the user requested a force-push
+	force_push_file="$state_dir/force_push"
+
+	# hash of the target commit
+	target_file="$state_dir/target"
+
+	# branches selected for moving as commit, branch_name; some may not have special commits and will not be moved at all
+	selected_file="$state_dir/selected"
+
+	# hashes of commits to be dropped
+	dropped_file="$state_dir/dropped"
+
+	# topologically sorted list of commits we need to recreate as commit, parent_commit
+	reproduce_file="$state_dir/reproduce"
+
+	# list of created commits and backlink to their original as orig_hash, new_hash
+	replace_file="$state_dir/replace"
+
+	# orig_hash of the last commit to be transplanted to the target bush
+	cherry_file="$state_dir/cherry"
+}
+
+usage() {
+	block "
+		$git_command - rebase multiple branches at the same time
+
+		restack branches onto the <target> committish
+
+			$ $git_command [ --drop/-d <committish> ] [ --dry-run/-n ] [ --push/-p ] [ -- ] <target> [ <filter> ... ]
+
+			options
+				--drop <committish>		leaves out the given commit when reproducing on the new target
+										this option can be given multiple times
+				--affected				prints branches that would be moved, but does not actually do anything
+				--dry-run				recreates all commits on the new target, but does not move branches
+				--push					does a git push --force-with-lease on every branch after it has been moved
+				--goto <commitish>		after restacking, check out this commit - or its replacement if possible
+				--						stops processing options
+
+			filters
+				an inclusion filter is just a committish: all descendants of this commit will be included
+				an exclusion filter is a committish prefixed with a caret: all descentants of this commit will be excluded
+				in case there is no inclusion filter, HEAD is included automatically
+
+		continue restacking after a cherry-pick failed and was resolved
+
+			$ $git_command --continue
+
+		continue restacking after a cherry-pick failed after leaving out the commit
+
+			$ $git_command --skip
+
+		stop restacking after a failed cherry-pick and reset to the previous state
+
+			$ $git_command --abort
+
+		stop restacking but leave the repository state as it is
+
+			$ $git_command --quit
+
+		disable automatic pushing of branches for the running operation
+
+			$ $git_command --no-push
+
+		print a bash completion script to standard out.
+
+			$ $git_command --completion
+
+			include this line in your ~/.bashrc to use it
+
+			$ eval \"\$(git-restack --completion)\"
+
+		show this help page
+
+			$ $git_command -h
+	"
+}
+
+completion() {
+	block <<'EOF'
+		#
+		# completion helper for bash-completion
+		#
+		# to activate this code, include this line in your ~/.bashrc
+		# $ eval "$(git-restack --completion)"
+		#
+		# the magic name "_git_restack" is used by /usr/share/bash-completion/completions/git
+		# to provide completions for the command "git restack". internally, this uses the bash builtin "complete".
+		#
+		_git_restack() {
+			# initialize $__git_repo_path
+			__git_find_repo_path
+			# shellcheck disable=SC2154
+			[[ -d "$__git_repo_path" ]]	|| return 1
+
+			if [[ -d "$__git_repo_path/restack" ]]; then
+				# there is a restack in progress
+
+				# shellcheck disable=SC2154
+				if [[ $cword == "2" ]]; then
+					# only one sequencer option can be used
+					__gitcomp "--continue --skip --abort --quit --no-push"
+				fi
+			else
+				# there is no restack running
+
+				# shellcheck disable=SC2154
+				if [[ "$cur" = -* ]]; then
+					# complete options when the user wants to
+					__gitcomp "--drop --push --dry-run --affected --goto --completion"
+				else
+					# or complete branches
+					# __gitcomp "$(__git_heads) $(__git_remote_heads)"
+					__git_complete_refs
+				fi
+			fi
+		}
+EOF
+}
+
+#-----------------------------------------------------------------------------
+# command implementation
+
+# find work to do and keep notes in $state_dir
+#
+# expects these variables to be set:
+#	affected			"true" or "false"
+#	dry_run				"true" or "false"
+#	force_push			"true" or "false"
+#	target_position		commit
+#	drop_positions		array of commits, may be empty
+#	selectors			array of commits, may be empty
+gather_data() {
+	log "gathering data"
+	log ""
+
+	[[ -z "$(git status --porcelain)" ]]	|| die "aborting: there are uncommitted changes"
+
+	[[ -d "$state_dir" ]]					&& die "aborting: there is a restack operation in progress already"
+
+	# NOTE this may work too, but returns HEAD when there is no branch at this commit:
+	# git rev-parse --symbolic-full-name HEAD | sed s,refs/heads/,,
+
+	local back_position
+	if [[ -n "$goto_position" ]]; then
+		back_position=$(git symbolic-ref -q --short "$goto_position"	|| git rev-parse "$goto_position")	|| die "cannot determine goto position"
+	else
+		back_position=$(git symbolic-ref -q --short HEAD				|| git rev-parse HEAD)				|| die "cannot determine start position"
+	fi
+	# log "back position: $back_position"
+
+	local target_hash
+	target_hash=$(git rev-parse --verify --quiet "$target_position")	|| die "target $target_position does not point to a commit"
+	# log "target hash: $target_hash"
+
+	# build options for git-for-each-ref
+	local select_options=()
+	local select_head="true"
+	local selector_arg
+	local selector_committish
+	for selector_arg in "${selectors[@]}"; do
+		if [[ $selector_arg == ^* ]]; then
+			selector_committish="${selector_arg:1}"
+			select_options+=( --no-contains "$selector_committish" )
+		else
+			selector_committish="$selector_arg"
+			select_options+=( --contains "$selector_committish" )
+
+			select_head="false"
+		fi
+		# git rev-parse --verify --quiet "$selector_committish"	|| die "selector $selector_arg does not point to a commit"
+	done
+	# if there was no positive filter at all, the user meant HEAD
+	[[ $select_head == "true" ]] && select_options+=( --contains "HEAD" )
+
+	# usually, it does not make sense to find branches already being on top of the target
+	# we do want to drop commits without moving to a new target, though
+	(( ${#drop_positions[@]} == 0 )) &&	select_options+=( --no-contains "$target_hash" )
+
+	# hash and name of branches to move
+	# includes the selector iff it was a branch
+	# format: hash,name
+	#
+	# NOTE @see https://git-scm.com/docs/git-for-each-ref#_field_names
+	# NOTE we could additionally use --no-merged "$target_hash" but then a branch which is a parent of the target would no longer be rebased
+	#
+	local selected
+	selected=$(git for-each-ref "${select_options[@]}" --format "%(objectname)${tab}%(refname:short)" refs/heads/)	|| die "cannot find selection"
+	[[ -n "$selected" ]]	|| die "did not find any branches in the current selection and outside $target_position"
+	# NOTE fails when selector and target are the same, in this case a better error message would be useful
+
+	# find tip hashes
+	local selected_hash_array=()
+	local selected_hash
+	local _selected_name
+	while IFS="$tab" read -r selected_hash _selected_name; do selected_hash_array+=( "$selected_hash" ); done <<<"$selected"
+	# log "selected hashes:" "${selected_hash_array[@]}"
+
+	# find commits to be dropped
+	local dropped
+	dropped=$(
+		for drop_position in "${drop_positions[@]}"; do
+			git rev-parse --verify --quiet "$drop_position"	|| die "drop $drop_position not point to a commit"
+		done
+	)
+
+	# find all commits to reproduce and their parents
+	# format: orig_hash, orig_parent
+	# in the right order to cherry-pick them
+	local reproduce_raw
+	reproduce_raw=$(git rev-list --parents --reverse --topo-order "${selected_hash_array[@]}" --not "$target_hash")	|| die "cannot find commits"
+	local reproduce
+	reproduce=$(tr ' ' "$tab" <<<"$reproduce_raw")	|| die "cannot format commits"
+	# git restack devel devel^ may select a branch sitting on devel^ but this will not require commits to be reproduced
+	[[ -n "$reproduce" ]]	|| die "did not find any commits to reproduce in the current selection and outside $target_position"
+
+	# bail out when we encounter a merge commit
+	local orig_hash
+	local orig_parent
+	local orig_parent_count
+	while IFS="$tab" read -r orig_hash orig_parent; do
+		orig_parent_count=$(git show --no-patch --format="%P" "$orig_hash" | wc -w)
+		[[ $orig_parent_count -eq 1 ]]	|| die "commit $orig_hash is a merge commit, those are not supported ($orig_parent_count)"
+	done <<<"$reproduce"
+
+	[[ "$affected" == "true" ]] && {
+		get_fields 2 1 <<<"$selected"
+		exit 0
+	}
+
+	# write state
+	mkdir -p "$state_dir"							|| die "cannot create state dir $state_dir"
+	echo "$back_position"	> "$back_file"			|| die "cannot write back file"
+	echo "$dry_run"			> "$dry_run_file"		|| die "cannot write dry_run file"
+	echo "$force_push"		> "$force_push_file"	|| die "cannot write force_push file"
+	echo "$target_hash"		> "$target_file"		|| die "cannot write target file"
+	echo "$selected"		> "$selected_file"		|| die "cannot write selected file"
+	echo "$dropped"			> "$dropped_file"		|| die "cannot write dropped file"
+	echo "$reproduce"		> "$reproduce_file"		|| die "cannot write reproduce file"
+	touch "$replace_file"							|| die "cannot create replace file"
+}
+
+# use the notes in $state_dir to reproduce missing commits and move branches
+#
+# stops when a cherry-pick cannot be applied
+proceed() {
+	pick_cherries	&&
+	move_branches	&&
+	back_to_start	&&
+	remove_state
+}
+
+# use the notes in $state_dir to reproduce missing commits
+#
+# the idea here is to go over all commits we have to reproduce in topological order from parent to child
+# and create one new commit for each original commit with git-cherry-pick
+# while doing this, we always remember which new commit replaces which original commit:
+# this way we can use the parent of the original commit to look up the parent of the new commit,
+# and then we can check out the new parent before cherry-picking the new child on top of it
+pick_cherries() {
+	[[ -d "$state_dir"		]]	|| die "aborting: no restack operation in progress"
+	[[ -f "$target_file"	]]	|| die "cannot find target file"
+	[[ -f "$dropped_file"	]]	|| die "cannot find dropped file"
+	[[ -f "$reproduce_file"	]]	|| die "cannot find reproduce file"
+	[[ -f "$replace_file"	]]	|| die "cannot find replace file"
+	[[ -f "$cherry_file"	]]	&& die "there is still a cherry-pick in progress"
+
+	log "reproducing commits"
+	log ""
+
+	local target
+	target=$(<"$target_file")	|| die "cannot read target file"
+
+	local orig_hash
+	local orig_parent
+	while IFS="$tab" read -r orig_hash orig_parent; do
+		# ignore commits we already have a replacement for
+		local old_replace
+		old_replace=$(map_value "$orig_hash" <"$replace_file")
+		[[ -z "$old_replace" ]]	|| continue
+
+		# find the new parent for the current cherry
+		local new_parent
+		new_parent=$(map_value "$orig_parent" <"$replace_file")
+		# a commit whose parent is not one of the commits we want to replace goes directly on the target
+		[[ -n "$new_parent" ]]	|| new_parent="$target"
+
+		local orig_message
+		orig_message=$(git log --format=%s "$orig_hash" -1)	|| die "cannot read commit message"
+
+		local new_hash
+		if grep -x -F "$orig_hash" <"$dropped_file" >/dev/null; then
+			log "dropping commit $orig_hash and have its children adopted by its new parent commit $new_parent"
+
+			# the new commit is to be dropped
+			# we pretend we recreated it, and redirect all child commits to its new parent
+			new_hash="$new_parent"
+		elif [[ "$new_parent" == "$orig_parent" ]]; then
+			log "leaving commit on $orig_parent: $orig_hash"
+
+			# the new commit is on the desired parent already so we can fast-forward
+			# remember we have fast-forwarded the commit for the next round
+			new_hash="$orig_hash"
+		else
+			log "recreating commit on $new_parent: $orig_hash $orig_message"
+
+			# NOTE this is not always necessary: in most cases, we will already be on the new_parent
+			git checkout --quiet "$new_parent"	|| die "cannot checkout $new_parent"
+
+			# remember the original commit we are about to pick in case we fail due to unresolved conflicts
+			echo "$orig_hash" >"$cherry_file"	|| die "cannot write cherry file"
+
+			#
+			# NOTE we want to skip commits coming in empty
+			# NOTE we want to skip commits which are redundant (after apply do not change any files)
+			#
+			# incoming empty normally fails, but can be allowed with --allow-empty
+			# redundant normally fails, but can be kept with --keep-redundant-commits
+			#
+			# from git 2.45.0 deprecated --keep-redundant-commits  in favor of --empty=keep
+			# and added --empty=drop so they can silently be dropped.
+			#
+			# we simply allow empty incoming commits as well as redundant commmits
+			# and check after the pick whether any files were actually changed
+			#
+			# another solution would be to apply manually git format-patch and git-am, or git apply
+			# yet another solution would be to use git-cherry to find commits we do not need
+			# as a last resort, we could use git rebase which _does_ support --empty=drop already
+			#
+			# @see https://stackoverflow.com/questions/50540625/why-does-git-cherry-pick-allow-empty-have-no-effect
+			# @see https://stackoverflow.com/questions/40988113/cherry-pick-set-of-commits-from-other-branch-skipping-empty-commits
+			# @see https://stackoverflow.com/questions/1994463/how-to-cherry-pick-a-range-of-commits-and-merge-them-into-another-branch
+			# @see https://stackoverflow.com/questions/11605703/git-finding-duplicate-commits-by-patch-id
+			#
+			# maybe we can reuse the patch-id used in git cherry/patch-id/rev-list
+			# @see https://stackoverflow.com/questions/45847724/how-does-git-rebase-recognize-aliased-commits
+			#
+			git cherry-pick --allow-empty --keep-redundant-commits "$orig_hash"	||	die "$(pick_failure "$orig_hash" "$orig_message")"
+
+			# detect when an empty commit was created, the change_count is 0 then
+			local change_count
+			change_count=$(git rev-list --count "${new_parent}..HEAD" "$toplevel_dir")
+
+			if [[ $change_count -gt 0 ]]; then
+				# normal, non-empty commit:
+				# remember we have replaced the commit for the next round
+				new_hash=$(git rev-parse HEAD)	|| die "cannot rev-parse HEAD"
+
+				log "recreated commit $orig_hash as new commit $new_hash"
+			else
+				# empty commit:
+				# skip it by replacing the orig_hash with the new_parent in the future
+				new_hash="$new_parent"
+
+				# could be because the orig commit was empty
+				# or because it was redundant
+				log "skipped commit $orig_hash as it does not change any files"
+			fi
+
+			rm "$cherry_file"	|| die "cannot remove cherry file"
+		fi
+
+		# remember the new replacement commit so it can be used in the next iteration
+		print_fields "$orig_hash" "$new_hash" >>"$replace_file"	|| die "cannot extend replace file"
+	done <"$reproduce_file"
+}
+
+# in a failed cherry-pick, continue with a fixed cherry or skip the commit and use its parent instead
+resume() {
+	# "--continue" or "--skip"
+	local action="$1"
+
+	log "resuming cherry-pick"
+	log ""
+
+	# was remembered just before the failed git cherry-pick
+	[[ -d "$state_dir"		]]	|| die "aborting: no restack operation in progress"
+	[[ -f "$cherry_file"	]]	|| die "there is no cherry-pick running"
+	[[ -f "$replace_file"	]]	|| die "cannot find replace file"
+
+	local orig_hash
+	orig_hash=$(<"$cherry_file")	|| die "cannot original hash"
+
+	local orig_message
+	orig_message=$(git log --format=%s "$orig_hash" -1)	|| die "cannot read commit message"
+
+	git cherry-pick "$action"		|| die "$(pick_failure "$orig_hash" "$orig_message")"
+
+	local new_hash
+	new_hash=$(git rev-parse HEAD)	|| die "cannot determine HEAD"
+
+	print_fields "$orig_hash" "$new_hash" >>"$replace_file"	|| die "cannot extend replace file"
+
+	rm "$cherry_file"				|| die "cannot remove cherry file"
+}
+
+pick_failure() {
+	local orig_hash="$1"
+	local orig_message="$2"
+
+	block "
+		==================================================
+
+		cherry-picking failed for this commit:
+
+		$orig_hash
+		$orig_message
+
+		==================================================
+
+		after resolving conflicts, call
+
+			$git_command --continue
+
+		to skip the commit, call
+
+			$git_command --skip
+
+		to give up restacking, call
+
+			$git_command --abort
+	"
+}
+
+# in a failed cherry-pick, abort what we started
+abort() {
+	log "aborting cherry-pick"
+	log ""
+
+	[[ -d "$state_dir"		]]	|| die "aborting: no restack operation in progress"
+	[[ -f "$cherry_file"	]]	|| die "there is no cherry-pick running"
+
+	if git rev-parse >/dev/null --verify --quiet CHERRY_PICK_HEAD; then
+		git cherry-pick --abort	|| die "cannot abort cherry-pick"
+	else
+		# happens when the user aborted the cherry-pick manually
+		log "nothing to abort, there is no cherry-pick operation in progress"
+	fi
+
+	# this does not produce a new replacement as there is no commit
+
+	rm "$cherry_file"		|| die "cannot remove cherry file"
+}
+
+disable_push() {
+	log "disabling automatic pushes"
+	log ""
+
+	[[ -d "$state_dir"		]]	|| die "aborting: no restack operation in progress"
+	[[ -f "$force_push_file" ]]	|| die "cannot find force push file"
+
+	echo "false" >"$force_push_file"
+}
+
+cleanup() {
+	log "cleaning up"
+	log ""
+
+	# ignore a non-existing state dir
+	if [[ -d "$state_dir"	]]; then
+		# ignore a non-existing cherry-pick
+		if git rev-parse --verify --quiet CHERRY_PICK_HEAD; then
+			log "quitting cherry-pick"
+			git cherry-pick --abort	|| die "cannot quit cherry-pick"
+		else
+			log "no cherry-pick to quit"
+		fi
+
+		log "removing state"
+		rm -r "$state_dir"	|| die "cannot remove state"
+	else
+		log "no restack in progress"
+	fi
+}
+
+# use the notes in $state_dir to move branches
+# must not be called before pick_cherries has been run successfully
+move_branches() {
+	[[ -d "$state_dir"			]]	|| die "aborting: no restack operation in progress"
+	[[ -f "$dry_run_file"		]]	|| die "cannot find dry_run file"
+	[[ -f "$force_push_file"	]]	|| die "cannot find push file"
+	[[ -f "$replace_file"		]]	|| die "cannot find replace file"
+	[[ -f "$cherry_file"		]]	&& die "there is still a cherry-pick in progress"
+
+	log "checking branches"
+	log ""
+
+	local dry_run
+	local force_push
+	dry_run=$(<"$dry_run_file")			|| die "cannot read dry_run file"
+	force_push=$(<"$force_push_file")	|| die "cannot read force_push file"
+
+	# calculate changes
+	# format: branch_hash, branch_name, new_hash
+	local changes
+	changes=$(
+		while IFS="$tab" read -r branch_hash branch_name; do
+			# for selected branches which are a a child of the target,
+			# we never create any replacements so these should be skipped
+			map_value "$branch_hash" <"$replace_file"	|
+			while read -r new_hash; do
+				print_fields "$branch_hash" "$branch_name" "$new_hash"
+			done
+		done <"$selected_file"
+	)
+
+	# possible early exit
+	[[ -n "$changes" ]]	|| {
+		log "nothing to do"
+		return
+	}
+
+	# NOTE we print commands before anything can fail to ensure it's visible to the user
+
+	log "commands to move selected branches to their new commits"
+	log ""
+	foreach_branch <<<"$changes" log_move_branch
+	log ""
+
+	log "commands to move selected branches back to their original commits"
+	log ""
+	foreach_branch <<<"$changes" log_restore_branch
+	log ""
+
+	log "commands to push selected branches"
+	log ""
+	foreach_branch <<<"$changes" log_push_branch
+	log ""
+
+	if [[ "$dry_run" == "false" ]]; then
+		log "moving branches"
+		log ""
+		foreach_branch <<<"$changes" do_move_branch
+		log ""
+
+		# using git update-ref to move the ref in HEAD may lead to to uncommited changes:
+		# this happened when only deleting the tip commit of the current branch:
+		# most of the time, sooner or later a git checkout will change the HEAD away from all branches
+		# but not in this case, because not a single commit has to be reproduced
+		#
+		# for now, we just reset the worktree:
+		# in most cases there will be nothing to reset, but then it is a no-op and doesn't hurt.
+		# and: we did ensure there are no uncommitted changes so there is no risk we reset pre-existing changes.
+		# see below for a way to test whether we actually updated the HEAD ref
+		log "resetting worktree"
+		log ""
+		git reset --hard
+		log ""
+
+		if [[ $force_push == "true" ]]; then
+			log "pushing branches"
+			log ""
+			foreach_branch <<<"$changes" do_push_branch
+			log ""
+		fi
+	fi
+}
+
+# read branch info from stdin and run a command with branch_hash, branch_name and new_hash set
+foreach_branch() {
+	local branch_hash branch_name new_hash
+	while IFS="$tab" read -r branch_hash branch_name new_hash; do
+		"$@"
+	done
+}
+
+# update a branch to point to the new hash
+# requires $branch_hash, $branch_name and $new_hash to be set
+do_move_branch() {
+	#	# empty when the HEAD is detached
+	#	local current_head
+	#	current_head=$(git symbolic-ref -q  HEAD)
+	#	[[ "$current_head" == "refs/heads/$branch_name" ]] && log "updating the HEAD, this may leave uncommited changes around"
+
+	# git branch --force "$branch_name" "$new_hash"
+	git update-ref -m "restack: moved from $branch_hash to $new_hash" "refs/heads/$branch_name" "$new_hash"			|| die "cannot update branch $branch_name to $new_hash"
+}
+
+# log how to update a branch to point to the new hash
+# requires $branch_hash, $branch_name and $new_hash to be set
+log_move_branch() {
+	# TODO add the quoted reflog message here?
+	log git update-ref "refs/heads/$branch_name" "$new_hash"
+}
+
+# update a branch to point to the old hash
+# requires $branch_hash, $branch_name and $new_hash to be set
+do_restore_branch() {
+	git update-ref -m "restack: restored to $branch_hash from $new_hash" "refs/heads/$branch_name" "$branch_hash"	|| die "cannot restore branch $branch_name to $branch_hash"
+}
+
+# update a branch to point to the old hash
+# requires $branch_hash, $branch_name and $new_hash to be set
+log_restore_branch() {
+	# TODO add the quoted reflog message here?
+	log git update-ref "refs/heads/$branch_name" "$branch_hash"
+}
+
+# force-push a branch to the origin
+# requires $branch_hash, $branch_name and $new_hash to be set
+do_push_branch() {
+	# TODO this logs but does not die - we should still return a bad error code when this happens!
+	git push --force-with-lease "$origin" "$branch_name:$branch_name"												|| log "ERROR cannot force push branch $branch_name to $origin"
+}
+
+# log how to force-push a branch to the origin
+# requires $branch_hash, $branch_name and $new_hash to be set
+log_push_branch() {
+	log git push --force-with-lease "$origin" "$branch_name:$branch_name"
+}
+
+# back to where we came from
+back_to_start() {
+	log "going back"
+	log ""
+
+	[[ -d "$state_dir"		]]	|| die "aborting: no restack operation in progress"
+	[[ -f "$back_file"		]]	|| die "cannot find back file"
+	[[ -f "$replace_file"	]]	|| die "cannot find replace file"
+
+	local back_position
+	back_position=$(<"$back_file")	|| die "cannot read back file"
+
+	# we never have a replacement for a branch we started from,
+	# but we may have a replacement commit for the start commit
+	local replaced_position
+	replaced_position=$(map_value "$back_position" <"$replace_file")
+	[[ -n "$replaced_position" ]]	|| replaced_position="$back_position"
+
+	[[ "$replaced_position" == "$back_position" ]]	||
+	log "checkout target was $back_position"
+
+	log "checking out $replaced_position"
+	git checkout --quiet "$replaced_position"	|| die "cannot go back to the starting point"
+	log ""
+}
+
+# remove state, shows we are not in a cherry-pick or restack
+remove_state() {
+	log "removing state"
+	log ""
+
+	[[ -d "$state_dir"	]]	|| die "aborting: no restack operation in progress"
+
+	rm -r "$state_dir"	|| die "cannot remove state"
+}
+
+#-----------------------------------------------------------------------------
+# table functions
+
+tab=$'\t'
+
+# use a mapping to calculate a replacement value
+map_value() {
+	where_field 1 "$1" | get_fields 2
+}
+
+# get all lines where a given field is (not) equal to a value
+# [--not] field value
+where_field() {
+	local not="false";	[[ $1 == "--not" ]] && { not=true; shift;	}
+
+	local field="$1"
+	local value="$2"
+
+	local -a data
+	local cell
+	while IFS="$tab" read -r -a data; do
+		cell="${data[$((field - 1))]}"
+		[[
+			$not = "false"	&& "$cell" =	"$value" ||
+			$not = "true"	&& "$cell" !=	"$value"
+		]] &&
+		print_fields "${data[@]}"
+	done
+}
+
+# get fields by a list of indices (starting at 1)
+get_fields() {
+	local -a input
+	local -a output
+	local field
+	while IFS="$tab" read -r -a input; do
+		output=()
+		for field in "$@"; do
+			output+=( "${input[$((field - 1))]}" )
+		done
+		print_fields "${output[@]}"
+	done
+}
+
+# print nary arguments with tab separators
+print_fields() {
+	printf '\t%s' "$@" | cut -c 2-
+}
+
+# awk but preconfigured for tab separated fields
+# NOTE unused
+awk_tab() {
+	awk -v "FS=$tab" -v "OFS=$tab" "$@"
+}
+
+# sort but preconfigured for tab separated fields
+# NOTE unused
+sort_tab() {
+	sort -t "$tab" "$@"
+}
+
+# join but preconfigured for tab separated fields
+# NOTE unused
+join_tab() {
+	# NOTE requires sort_tab -k 1b,1 for both files
+	join -t "$tab" "$@"
+}
+
+#-----------------------------------------------------------------------------
+# text functions
+
+# documentation formatting helper improving on both cat <<-EOT and git stripspace
+# expands tabs (size 4)
+# drops trailing spaces
+# removes blank lines at the beginning and then end
+# conflates multiple blank lines into a single one
+# removes common indentation
+block() {
+	(( $# != 0 )) && { block <<<"$@"; return $?; }
+
+	expand -t 4	|
+	awk '
+		BEGIN {
+			count	= 0
+			blank	= 0
+			start	= 0
+		}
+		/[^ ]/ {
+			# here we know when to actually insert a blank line
+			if (blank && count > 0)	lines[count++]	= ""
+			blank	= 0
+
+			sub(/ +$/, "", $0)
+			lines[count++]	= $0
+
+			# calculate the new common indent: 0 is treated like +infinity here
+			indent	= match($0, /[^ ]/)
+			start	= start == 0 || indent < start ? indent : start
+		}
+		!/[^ ]/ {
+			blank	= 1
+		}
+		END	{
+			for (i=0; i<count; i++) print substr(lines[i], start)
+		}
+	'
+}
+
+#-----------------------------------------------------------------------------
+
+main "$@"

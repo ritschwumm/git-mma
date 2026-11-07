@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# create a bare words commit without content (except a special empty file to
+# prevent duplicating todo commits in a rebase)
+#===============================================================================
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+# toplevel never ends in a slash. prefix always ends in a slash
+toplevel=$(git rev-parse --show-toplevel)	|| die "not in a git repo"
+# prefix=$(git rev-parse --show-prefix)		|| die "not in a git repo"
+
+[[ $# -ne 0 ]]						|| die "usage: git todo [ texts ]*"
+
+[[ -z $(git status --porcelain) ]]	|| die "there are uncommitted changes"
+
+dir="$toplevel/.todo"
+mkdir -p "$dir"				|| die "cannot create $dir"
+
+file="$dir/$(date +%s)-$RANDOM"
+touch "$file"				|| die "cannot create $file"
+
+git add "$file"				|| die "cannot add $file"
+git commit -m "[todo] $*"	|| die "cannot commit $file"

@@ -1,0 +1,31 @@
+[alias]
+	#-----------------------------------------------------------------------------
+	# git-sequence
+
+	continue	= sequence --continue
+	skip		= sequence --skip
+	abort		= sequence --abort
+	quit		= sequence --quit
+
+	#-----------------------------------------------------------------------------
+	# git-restack
+
+	on = restack
+	onh = restack HEAD
+
+	#-----------------------------------------------------------------------------
+	# git-ox
+
+	rox = ox reword
+	fox = ox amend
+	mox = ox append
+	dox = ox delete
+
+	#-----------------------------------------------------------------------------
+	# git-advance
+
+	# navigate to the next commit (if it is unambiguous)
+	fwd	= advance
+
+	# navigate to the previous commit
+	back = checkout HEAD~

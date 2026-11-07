@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+#===============================================================================
+# manages a single temporarey branch named "tmp"
+#===============================================================================
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+branch="tmp"
+
+# something like "git tmp"
+git_command=$(basename -- "$0" | sed 's/^git-/git /')
+
+usage="usage: $git_command [ --delete/-d | <committish> ]"
+
+(( $# <= 1 ))	|| die "usage: $(basename "$0") [ --delete/-d | <committish> ]"
+
+case "$1" in
+	-h)
+		log "$usage"
+		;;
+	--delete|-d)
+		git branch -D "$branch"					|| die "cannot delete branch"
+		;;
+	*)
+		target="${1:-HEAD}"
+		git rev-parse --verify --quiet "$target"	|| die "target commit $target does not exist"
+		git checkout --detach						|| die "failed to detach from branch"
+		git update-ref -d "refs/heads/$branch"		|| die "failed to delete old branch"
+		git checkout -b "$branch" "$target"			|| die "failed to create new branch"
+		;;
+esac

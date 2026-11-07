@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2312 disable=SC2034
+
+# prevents pushing the tmp branch
+
+die() { log "$@"; exit 1; }
+log() { echo >&2 "$@"; }
+
+protected="refs/heads/tmp"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+	[[ "$local_ref" != "$protected" ]]	|| {
+		log	""
+		log "computer says no"
+		die ""
+	}
+done
